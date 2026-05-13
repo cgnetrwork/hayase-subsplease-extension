@@ -1,0 +1,31 @@
+{
+  "name": "SubsPlease",
+  "id": "subsplease",
+  "version": "1.2.0",
+  "description": "Stream the latest seasonal anime in 1080p from SubsPlease. Uses the SubsPlease JSON API for search and episode listings, with RSS as a fallback.",
+  "author": "your-username",
+  "language": "en",
+  "type": "js",
+  "entry": "subsplease.js",
+  "icon": "https://subsplease.org/favicon.ico",
+  "source": "https://subsplease.org",
+  "exports": [
+    "search",
+    "latest",
+    "detail",
+    "schedule"
+  ],
+  "settings": {
+    "resolution": {
+      "label": "Preferred Resolution",
+      "type": "select",
+      "default": "1080p",
+      "options": ["1080p", "720p", "sd"]
+    },
+    "fallback_rss": {
+      "label": "Use RSS as fallback if API fails",
+      "type": "boolean",
+      "default": true
+    }
+  }
+}
