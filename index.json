@@ -11,6 +11,6 @@
     "languages": ["US", "JP"],
     "icon": "https://subsplease.org/favicon.ico",
     "update": "gh:cgnetrwork/hayase-subsplease-extension",
-    "code": "gh:cgnetrwork/hayase-subsplease-extension/extensions/subsplease"
+    "code": "gh:cgnetrwork/hayase-subsplease-extension/extensions/subsplease/subsplease.js"
   }
 ]
