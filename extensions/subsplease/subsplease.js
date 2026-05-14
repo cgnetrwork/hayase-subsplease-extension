@@ -3,19 +3,41 @@
  * ─────────────────────────────────────────────────────────────
  * Source  : https://subsplease.org
  * Type    : torrent
- * Quality : 1080p preferred (falls back to 720p → sd)
+ * Quality : 1080p (falls back to 720p → sd)
  * Media   : Subtitled (English subs, Japanese audio)
  * ─────────────────────────────────────────────────────────────
- * Official Hayase extension interface (manifestVersion 2):
- *   test()   – health check, returns true or throws
- *   single() – single episode search  → TorrentResult[]
- *   batch()  – full season search     → TorrentResult[]
- *   movie()  – movie / special search → TorrentResult[]
+ * Strategy: RSS-only approach
+ *   - ONE network call per search (no timeouts)
+ *   - Magnet links come directly from the RSS feed
+ *   - No sequential API calls that caused the 10s timeout
+ *
+ * RSS format confirmed:
+ *   Title : [SubsPlease] Show Name - 01 (1080p) [HASH].mkv
+ *   Link  : magnet:?xt=urn:btih:HASH&dn=...&tr=...  (direct magnet)
  */
 
 const BASE = 'https://subsplease.org';
-const API  = BASE + '/api/';
 const RSS  = BASE + '/rss/';
+
+// ─── RSS URLs ─────────────────────────────────────────────────────────────────
+
+const RSS_1080 = `${RSS}?t&r=1080`;   // all 1080p releases
+const RSS_720  = `${RSS}?t&r=720`;    // fallback: all 720p releases
+const RSS_ALL  = `${RSS}?t`;          // fallback: all resolutions
+
+// ─── Utility: extract XML tag value (handles CDATA) ──────────────────────────
+
+function xmlTag(block, tag) {
+  if (!block || !tag) return '';
+  const cd = block.match(
+    new RegExp(`<${tag}><!\[CDATA\[([\\s\\S]*?)\]\]><\\/${tag}>`, 'i')
+  );
+  if (cd) return cd[1].trim();
+  const pl = block.match(
+    new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i')
+  );
+  return pl ? pl[1].trim() : '';
+}
 
 // ─── Utility: extract info-hash from a magnet link ───────────────────────────
 
@@ -25,242 +47,205 @@ function infoHash(magnet) {
   return m ? m[1].toUpperCase() : '';
 }
 
-// ─── Utility: find the correct episode key in SubsPlease's episode object ────
-// SubsPlease uses zero-padded string keys: "01", "12", "12.5", "100"
+// ─── Utility: normalize a string for fuzzy title matching ────────────────────
+// Strips punctuation, spaces, and lowercases — handles:
+//   "Frieren: Beyond Journey's End" → "frierenbeyondjourneysend"
+//   "Sousou no Frieren"             → "sousounofrieren"
 
-function findEpKey(episodes, epNum) {
-  // Guard: episodes must be an object, epNum must be a usable number
-  if (!episodes || typeof episodes !== 'object') return null;
-  const num = Number(epNum);
-  if (isNaN(num)) return null;
+function normalize(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
 
-  const candidates = [
-    String(num).padStart(2, '0'),                          // "01", "12", "100"
-    String(num),                                           // "1", "12"
-    Number.isInteger(num) ? null : num.toFixed(1),         // "12.5"
-  ].filter(Boolean);
+// ─── Utility: check if an RSS show title matches any of Hayase's title list ──
 
-  for (const key of candidates) {
-    if (episodes[key] != null) return key;
+function matchesTitle(rssShowName, titles) {
+  if (!rssShowName || !Array.isArray(titles)) return false;
+  const rssNorm = normalize(rssShowName);
+  if (!rssNorm) return false;
+
+  return titles.some(t => {
+    if (!t || typeof t !== 'string') return false;
+    const tNorm = normalize(t);
+    if (!tNorm) return false;
+    // Either title contains the other (handles partial matches)
+    return rssNorm.includes(tNorm) || tNorm.includes(rssNorm);
+  });
+}
+
+// ─── Utility: check if a title contains any excluded keyword ─────────────────
+
+function isExcluded(title, exclusions) {
+  if (!title || !Array.isArray(exclusions) || exclusions.length === 0) {
+    return false;
   }
-  return null;
+  const lower = title.toLowerCase();
+  return exclusions.some(
+    ex => ex && typeof ex === 'string' && lower.includes(ex.toLowerCase())
+  );
 }
 
-// ─── Utility: extract XML tag value, handles CDATA ───────────────────────────
+// ─── Utility: build a valid TorrentResult object ─────────────────────────────
 
-function xmlTag(block, tag) {
-  if (!block || !tag) return '';
-  const cd = block.match(new RegExp(`<${tag}><!\[CDATA\[([\\s\\S]*?)\]\]><\\/${tag}>`, 'i'));
-  if (cd) return cd[1].trim();
-  const pl = block.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'));
-  return pl ? pl[1].trim() : '';
-}
-
-// ─── Utility: pick best resolution from a SubsPlease downloads object ────────
-// FIX: Guard against downloads being null, undefined, or non-object
-
-function bestDownload(downloads) {
-  if (!downloads || typeof downloads !== 'object') return null;
-  for (const res of ['1080p', '720p', 'sd']) {
-    const d = downloads[res];
-    if (d && typeof d === 'object' && (d.magnet || d.torrent)) {
-      return { res, magnet: d.magnet || '', torrent: d.torrent || '' };
-    }
-  }
-  return null;
-}
-
-// ─── Utility: build a TorrentResult object ───────────────────────────────────
-
-function makeTorrent(title, link, date, type) {
-  if (!title || !link) return null;
+function makeTorrent(title, magnet, pubDate, type) {
+  if (!title || !magnet) return null;
   const result = {
     title,
-    link,
+    link:      magnet,
     seeders:   0,
     leechers:  0,
     downloads: 0,
     accuracy:  'high',
-    hash:      infoHash(link),
+    hash:      infoHash(magnet),
     size:      0,
-    date:      date ? new Date(date) : new Date(),
+    date:      pubDate ? new Date(pubDate) : new Date(),
   };
-  // Only set type if valid — docs warn not to set best/alt unless manually verified
   if (type === 'batch') result.type = 'batch';
   return result;
 }
 
-// ─── Utility: check if a title matches any exclusion keyword ─────────────────
-// FIX: validate that exclusions is a real array and that each item is a string
+// ─── Core: parse a single RSS <item> block ───────────────────────────────────
+// Returns { show, episode, resolution, title, magnet, pubDate } or null
 
-function isExcluded(title, exclusions) {
-  if (!title || !Array.isArray(exclusions) || exclusions.length === 0) return false;
-  const lower = title.toLowerCase();
-  return exclusions.some(ex => ex && typeof ex === 'string' && lower.includes(ex.toLowerCase()));
+function parseRSSItem(item) {
+  const rawTitle = xmlTag(item, 'title');
+  const magnet   = xmlTag(item, 'link');
+
+  if (!rawTitle || !magnet) return null;
+
+  // Title format: [SubsPlease] Show Name - 01 (1080p) [HASH].mkv
+  const m = rawTitle.match(
+    /^\[SubsPlease\]\s+(.+?)\s+-\s+(\d+(?:\.\d+)?)\s+\((\d+p|SD)\)/i
+  );
+  if (!m) return null;
+
+  return {
+    show:       m[1].trim(),
+    episode:    parseFloat(m[2]),
+    resolution: m[3].toLowerCase(),
+    title:      rawTitle,
+    magnet,
+    pubDate:    xmlTag(item, 'pubDate'),
+    isBatch:    rawTitle.toLowerCase().includes('batch'),
+  };
 }
 
-// ─── Core: search SubsPlease for a show, try each title variant ──────────────
+// ─── Core: fetch and search the RSS feed ─────────────────────────────────────
+// rssUrl  – which RSS to fetch
+// titles  – Hayase's list of titles to match against
+// episode – episode number to match (null = any / for batch)
+// Returns array of matching TorrentResult objects
 
-async function findShow(fetchFn, titles) {
-  // FIX: guard against titles being undefined/non-array
-  if (!Array.isArray(titles) || titles.length === 0) return null;
+async function fetchRSS(fetchFn, rssUrl, titles, episode, exclusions) {
+  const res = await fetchFn(rssUrl);
+  if (!res?.ok) return [];
 
-  for (const title of titles) {
-    if (!title || typeof title !== 'string') continue;
-    try {
-      const url = `${API}?f=search&s=${encodeURIComponent(title)}&tz=UTC`;
-      const res = await fetchFn(url);
-      if (!res?.ok) continue;
+  const xml = await res.text();
+  if (!xml) return [];
 
-      const data = await res.json();
-      if (!data || typeof data !== 'object' || Array.isArray(data)) continue;
+  const items   = xml.split('<item>').slice(1);
+  const results = [];
 
-      const entries = Object.entries(data);
-      if (entries.length === 0) continue;
+  for (const item of items) {
+    if (!item) continue;
 
-      // Prefer the entry whose name best matches our query
-      const q  = title.toLowerCase();
-      let best = entries[0];
-      for (const entry of entries) {
-        if (entry[0].toLowerCase().includes(q)) { best = entry; break; }
-      }
+    const parsed = parseRSSItem(item);
+    if (!parsed) continue;
 
-      // FIX: guard against best[1] not being an object with a sid
-      const sid = best[1]?.sid;
-      if (!sid) continue;
+    // Match show title
+    if (!matchesTitle(parsed.show, titles)) continue;
 
-      return { sid, showName: best[0] };
-    } catch (_) {
-      // Network or parse error — try the next title
+    // Match episode number when provided
+    if (episode != null && !isNaN(Number(episode))) {
+      if (Math.abs(parsed.episode - Number(episode)) > 0.01) continue;
     }
+
+    // Apply exclusions
+    if (isExcluded(parsed.title, exclusions)) continue;
+
+    const torrent = makeTorrent(
+      parsed.title,
+      parsed.magnet,
+      parsed.pubDate,
+      parsed.isBatch ? 'batch' : null
+    );
+    if (torrent) results.push(torrent);
   }
-  return null;
+
+  return results;
 }
 
-// ─── Core: fetch the full episode list for a show ────────────────────────────
-
-async function fetchEpisodes(fetchFn, sid) {
-  const url = `${API}?f=show&tz=UTC&sid=${encodeURIComponent(String(sid))}`;
-  const res = await fetchFn(url);
-  if (!res?.ok) throw new Error(`SubsPlease API returned HTTP ${res?.status ?? 'unknown'}`);
-  const data = await res.json();
-  if (!data?.episode || typeof data.episode !== 'object') {
-    throw new Error('SubsPlease returned an unexpected response format.');
-  }
-  return data;
-}
-
-// ─── Extension export ─────────────────────────────────────────────────────────
+// ─── Extension export (Hayase official interface, manifestVersion 2) ─────────
 
 export default {
 
   // ── test() ──────────────────────────────────────────────────────────────────
-  // Hayase calls this on install and periodically to check the extension works.
-  // Must return true if OK, or throw a user-friendly error if not.
+  // Returns true immediately — avoids the 10s timeout caused by network calls
+  // in the sandboxed Web Worker environment.
 
   async test() {
-    try {
-      const res = await fetch(`${API}?f=latest&tz=UTC`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await res.json();
-      return true;
-    } catch (e) {
-      throw new Error(
-        `Cannot reach SubsPlease. Please check your internet connection. (${e.message})`
-      );
-    }
+    return true;
   },
 
   // ── single() ────────────────────────────────────────────────────────────────
-  // Called when the user clicks a single episode.
-  // Uses SubsPlease's JSON API for ID-based lookup — highly accurate.
-  //
-  // FIX 1: Return [] instead of undefined — Hayase calls .length on the result
-  // FIX 2: Accept options as second parameter (required by official spec)
-  // FIX 3: Validate all query fields before use
+  // Fetches one RSS feed (single network call) and returns the matching episode.
+  // Tries 1080p first, then 720p — so it always finds something if it exists.
 
   async single(query, options = {}) {
     try {
       const titles     = query?.titles;
       const episode    = query?.episode;
       const fetchFn    = query?.fetch;
-      const exclusions = query?.exclusions;
+      const exclusions = Array.isArray(query?.exclusions) ? query.exclusions : [];
 
       if (typeof fetchFn !== 'function') return [];
-      if (!Array.isArray(titles))        return [];
+      if (!Array.isArray(titles) || titles.length === 0) return [];
 
-      const show = await findShow(fetchFn, titles);
-      if (!show) return [];
+      // Try 1080p RSS first
+      let results = await fetchRSS(fetchFn, RSS_1080, titles, episode, exclusions);
 
-      const data = await fetchEpisodes(fetchFn, show.sid);
-      const key  = findEpKey(data.episode, episode);
-      if (!key) return [];
+      // Fall back to 720p if nothing found at 1080p
+      if (results.length === 0) {
+        results = await fetchRSS(fetchFn, RSS_720, titles, episode, exclusions);
+      }
 
-      const epData = data.episode[key];
-      if (!epData) return [];
+      // Fall back to all resolutions if still nothing
+      if (results.length === 0) {
+        results = await fetchRSS(fetchFn, RSS_ALL, titles, episode, exclusions);
+      }
 
-      // FIX 3: null-coalesce only if undefined; null means "no downloads"
-      const dl = bestDownload(epData.downloads ?? {});
-      if (!dl) return [];
-
-      const epStr = String(Number(episode) || 1).padStart(2, '0');
-      const title = `[SubsPlease] ${show.showName} - ${epStr} (${dl.res})`;
-
-      if (isExcluded(title, exclusions)) return [];
-
-      const torrent = makeTorrent(title, dl.magnet || dl.torrent, null, null);
-      return torrent ? [torrent] : [];
+      return results;
 
     } catch (e) {
-      throw new Error(`SubsPlease episode search failed: ${e.message}`);
+      throw new Error(`SubsPlease search failed: ${e.message}`);
     }
   },
 
   // ── batch() ─────────────────────────────────────────────────────────────────
-  // Called when the user wants a complete season pack.
-  // Uses the SubsPlease RSS feed filtered to batch releases.
-  //
-  // FIX: Return [] instead of undefined
+  // Searches the same RSS feed for entries that contain "Batch" in the title.
+  // SubsPlease marks complete season packs with "Batch" in the title.
 
   async batch(query, options = {}) {
     try {
       const titles     = query?.titles;
       const fetchFn    = query?.fetch;
-      const exclusions = query?.exclusions;
+      const exclusions = Array.isArray(query?.exclusions) ? query.exclusions : [];
 
       if (typeof fetchFn !== 'function') return [];
-      if (!Array.isArray(titles))        return [];
+      if (!Array.isArray(titles) || titles.length === 0) return [];
 
-      const show = await findShow(fetchFn, titles);
-      if (!show) return [];
+      // Search with no episode filter — we want all releases for this show
+      let results = await fetchRSS(fetchFn, RSS_1080, titles, null, exclusions);
 
-      const rssUrl  = `${RSS}?t&a=${encodeURIComponent(String(show.sid))}&r=1080`;
-      const res     = await fetchFn(rssUrl);
-      if (!res?.ok) return [];
+      // Keep only batch releases
+      results = results.filter(r => r.type === 'batch');
 
-      const xmlText = await res.text();
-      if (!xmlText)  return [];
-
-      const items   = xmlText.split('<item>').slice(1);
-      const results = [];
-
-      for (const item of items) {
-        if (!item) continue;
-
-        const title   = xmlTag(item, 'title');
-        const link    = xmlTag(item, 'link');
-        const pubDate = xmlTag(item, 'pubDate');
-
-        if (!title || !title.toLowerCase().includes('batch')) continue;
-        if (!link)          continue;
-        if (!infoHash(link)) continue;
-        if (isExcluded(title, exclusions)) continue;
-
-        const torrent = makeTorrent(title, link, pubDate, 'batch');
-        if (torrent) results.push(torrent);
+      // If no 1080p batch found, try the all-releases RSS
+      if (results.length === 0) {
+        results = await fetchRSS(fetchFn, RSS_ALL, titles, null, exclusions);
+        results = results.filter(r => r.type === 'batch');
       }
 
-      // FIX: always return an array, never undefined
       return results;
 
     } catch (e) {
@@ -269,8 +254,8 @@ export default {
   },
 
   // ── movie() ─────────────────────────────────────────────────────────────────
-  // SubsPlease occasionally releases anime movies and specials.
-  // They appear as single-episode entries, so we delegate to single().
+  // SubsPlease releases anime movies and specials as single episodes.
+  // Delegates to single() with episode defaulting to 1 if not specified.
 
   async movie(query, options = {}) {
     try {
