@@ -1,16 +1,18 @@
 [
   {
+    "manifestVersion": 2,
     "name": "SubsPlease",
     "id": "subsplease",
-    "version": "1.2.0",
-    "description": "Stream seasonal anime from SubsPlease with 1080p torrent support.",
+    "version": "1.0.0",
     "type": "torrent",
     "accuracy": "high",
+    "updatePeers": true,
     "ratio": 0,
     "media": "sub",
     "languages": ["US", "JP"],
+    "url": "aHR0cHM6Ly9zdWJzcGxlYXNlLm9yZw==",
     "icon": "https://subsplease.org/favicon.ico",
-    "update": "gh:cgnetrwork/hayase-subsplease-extension",
-    "code": "gh:cgnetrwork/hayase-subsplease-extension/extensions/subsplease"
+    "update": "https://raw.githubusercontent.com/cgnetrwork/hayase-subsplease-extension/main/index.json",
+    "code": "https://raw.githubusercontent.com/cgnetrwork/hayase-subsplease-extension/main/extensions/subsplease/subsplease.js"
   }
 ]
