@@ -1,112 +1,83 @@
 /**
  * SubsPlease Extension for Hayase
  * ─────────────────────────────────────────────────────────────
- * Source  : https://subsplease.org
- * Strategy: RSS-only (1 network call, direct magnet links)
+ * Data source : Nyaa.si (searches for [SubsPlease] releases)
+ * Why Nyaa.si : SubsPlease.org uses Cloudflare which blocks all
+ *               programmatic requests, causing the 10s timeout.
+ *               Nyaa.si hosts every SubsPlease release, has no
+ *               blocking, and provides richer metadata (seeders,
+ *               leechers, size, hash) than SubsPlease's own RSS.
+ * Strategy    : One targeted Nyaa search per query — fast.
  * ─────────────────────────────────────────────────────────────
- * FIX 1: Regex now uses string concatenation, not template
- *         literals — template literals drop backslashes before
- *         [ and ] causing "Unmatched ')'" regex errors.
- * FIX 2: Title matcher skips Japanese-only strings and uses
- *         word-level matching for better romaji coverage.
  */
 
-const BASE    = 'https://subsplease.org';
-const RSS_URL = BASE + '/rss/';
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-// ─── Utility: extract XML tag value (CDATA-aware) ────────────────────────────
-// FIX: built with string concatenation so \\[ stays as \[ in the RegExp.
-// Template literals drop the backslash before [ and ] (unrecognised escape)
-// which breaks CDATA pattern into an invalid character class → "Unmatched )".
+// Nyaa.si RSS endpoint — category 1_2 = English-translated anime
+var NYAA = 'https://nyaa.si/?page=rss&c=1_2&f=0&q=';
+
+// ─── Utility: safe XML tag extractor (CDATA-aware) ───────────────────────────
+// Uses string concatenation — NOT template literals.
+// Template literals silently drop backslashes before [ and ] which breaks
+// the CDATA pattern into an invalid character class → "Unmatched )" error.
 
 function xmlTag(block, tag) {
   if (!block || !tag) return '';
-
-  // CDATA variant: <tag><![CDATA[...]]></tag>
+  // CDATA: <tag><![CDATA[...]]></tag>
   var cdRe = new RegExp(
     '<' + tag + '><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/' + tag + '>',
     'i'
   );
   var cd = block.match(cdRe);
   if (cd) return cd[1].trim();
-
-  // Plain text variant: <tag>...</tag>
+  // Plain text: <tag>...</tag>
   var plRe = new RegExp('<' + tag + '>([\\s\\S]*?)<\\/' + tag + '>', 'i');
   var pl = block.match(plRe);
   return pl ? pl[1].trim() : '';
 }
 
+// ─── Utility: parse Nyaa size string → bytes ─────────────────────────────────
+
+function parseSize(str) {
+  if (!str) return 0;
+  var m = str.match(/([\d.]+)\s*(GiB|MiB|KiB|GB|MB|KB)/i);
+  if (!m) return 0;
+  var v = parseFloat(m[1]);
+  var u = m[2].toUpperCase();
+  if (u === 'GIB' || u === 'GB') return Math.round(v * 1073741824);
+  if (u === 'MIB' || u === 'MB') return Math.round(v * 1048576);
+  if (u === 'KIB' || u === 'KB') return Math.round(v * 1024);
+  return 0;
+}
+
 // ─── Utility: extract info-hash from a magnet URI ────────────────────────────
 
 function infoHash(magnet) {
-  if (!magnet || typeof magnet !== 'string') return '';
+  if (!magnet) return '';
   var m = magnet.match(/urn:btih:([a-fA-F0-9]{40}|[A-Za-z2-7]{32})/i);
   return m ? m[1].toUpperCase() : '';
 }
 
-// ─── Utility: check if a character is ASCII (a-z, 0-9) ──────────────────────
+// ─── Utility: format episode number to SubsPlease naming convention ──────────
+// SubsPlease always zero-pads: 1→"01", 12→"12", 12.5→"12.5"
 
-function isAsciiChar(c) {
-  var code = c.charCodeAt(0);
-  return (code >= 48 && code <= 57) ||   // 0-9
-         (code >= 65 && code <= 90) ||   // A-Z
-         (code >= 97 && code <= 122);    // a-z
+function fmtEp(ep) {
+  var n = Number(ep);
+  if (isNaN(n) || n < 1) return '01';
+  return Number.isInteger(n) ? String(n).padStart(2, '0') : n.toFixed(1);
 }
 
-// ─── Utility: normalize a title for matching ─────────────────────────────────
-// Lowercases and strips all non-alphanumeric characters.
-// Returns '' for Japanese-only strings (no ASCII letters/digits to match on).
+// ─── Utility: detect if a string is mostly non-ASCII (Japanese/Korean/etc.) ──
+// Hayase's titles[] includes native-script titles — skip those for Nyaa search.
 
-function normalize(str) {
-  if (!str || typeof str !== 'string') return '';
-  var out = '';
+function isNonAscii(str) {
+  if (!str) return true;
+  var ascii = 0;
   for (var i = 0; i < str.length; i++) {
-    var c = str[i].toLowerCase();
-    if (isAsciiChar(c)) out += c;
+    if (str.charCodeAt(i) < 128) ascii++;
   }
-  return out;
-}
-
-// ─── Utility: split a normalized title into words of 3+ characters ───────────
-// Used for word-level matching so "Solo Leveling" matches "Solo Leveling S2".
-
-function words(normStr) {
-  // Split on transitions would be complex — just use 4-char sliding substrings
-  // as anchors. A simpler approach: treat the whole string and check includes.
-  return normStr; // we use substring matching below
-}
-
-// ─── Utility: title matching ─────────────────────────────────────────────────
-// Hayase provides titles[] = [English, Romaji, Native(Japanese), ...]
-// SubsPlease filenames use English or Romaji (ASCII-based).
-// Strategy:
-//   1. Normalize both strings (ASCII-only, lowercase, no punctuation)
-//   2. Skip any title that normalises to fewer than 4 chars (e.g. pure kanji)
-//   3. Match if one contains the other (handles shortened/partial titles)
-
-function matchesTitle(rssShowName, titles) {
-  if (!rssShowName || !Array.isArray(titles)) return false;
-
-  var rssNorm = normalize(rssShowName);
-  if (rssNorm.length < 3) return false;
-
-  for (var i = 0; i < titles.length; i++) {
-    var t = titles[i];
-    if (!t || typeof t !== 'string') continue;
-
-    var tNorm = normalize(t);
-    if (tNorm.length < 3) continue; // skip Japanese-only / too short
-
-    // Substring match in both directions
-    if (rssNorm.includes(tNorm) || tNorm.includes(rssNorm)) return true;
-
-    // Word-level: if the rss title starts with first 6 chars of query title
-    // handles "Solo Leveling Season 2" vs "Solo Leveling"
-    if (tNorm.length >= 6 && rssNorm.startsWith(tNorm.slice(0, 6))) return true;
-    if (rssNorm.length >= 6 && tNorm.startsWith(rssNorm.slice(0, 6))) return true;
-  }
-
-  return false;
+  // If less than half the characters are ASCII, treat as non-ASCII title
+  return ascii < str.length / 2;
 }
 
 // ─── Utility: exclusion check ────────────────────────────────────────────────
@@ -121,55 +92,11 @@ function isExcluded(title, exclusions) {
   return false;
 }
 
-// ─── Utility: build a TorrentResult ──────────────────────────────────────────
+// ─── Core: fetch Nyaa RSS and parse all [SubsPlease] items ───────────────────
+// Returns TorrentResult[] — full metadata from Nyaa's RSS.
 
-function makeTorrent(title, magnet, pubDate, isBatch) {
-  if (!title || !magnet) return null;
-  var result = {
-    title:     title,
-    link:      magnet,
-    seeders:   0,
-    leechers:  0,
-    downloads: 0,
-    accuracy:  'high',
-    hash:      infoHash(magnet),
-    size:      0,
-    date:      pubDate ? new Date(pubDate) : new Date(),
-  };
-  if (isBatch) result.type = 'batch';
-  return result;
-}
-
-// ─── Core: parse one RSS <item> block ────────────────────────────────────────
-// SubsPlease title format: [SubsPlease] Show Name - 01 (1080p) [HASH].mkv
-// The <link> tag contains the full magnet URI directly.
-
-function parseItem(item) {
-  var rawTitle = xmlTag(item, 'title');
-  var magnet   = xmlTag(item, 'link');
-  if (!rawTitle || !magnet) return null;
-
-  // Parse show name, episode number, and resolution from title
-  var m = rawTitle.match(
-    /^\[SubsPlease\]\s+(.+?)\s+-\s+(\d+(?:\.\d+)?)\s+\((\d+p|SD)\)/i
-  );
-  if (!m) return null;
-
-  return {
-    show:    m[1].trim(),
-    episode: parseFloat(m[2]),
-    res:     m[3].toLowerCase(),
-    title:   rawTitle,
-    magnet:  magnet,
-    pubDate: xmlTag(item, 'pubDate'),
-    isBatch: rawTitle.toLowerCase().includes('batch'),
-  };
-}
-
-// ─── Core: fetch RSS and return matching results ──────────────────────────────
-
-async function searchRSS(fetchFn, resolution, titles, episode, exclusions) {
-  var url = RSS_URL + '?t&r=' + resolution;
+async function nyaaFetch(fetchFn, searchQuery) {
+  var url = NYAA + encodeURIComponent(searchQuery);
   var res = await fetchFn(url);
   if (!res || !res.ok) return [];
 
@@ -183,37 +110,76 @@ async function searchRSS(fetchFn, resolution, titles, episode, exclusions) {
     var item = items[i];
     if (!item) continue;
 
-    var parsed = parseItem(item);
-    if (!parsed) continue;
+    var title = xmlTag(item, 'title');
+    // Only keep official SubsPlease releases
+    if (!title || !title.includes('[SubsPlease]')) continue;
 
-    // Show title must match
-    if (!matchesTitle(parsed.show, titles)) continue;
+    // Nyaa puts the magnet in <nyaa:magnetLink>
+    var magnet = xmlTag(item, 'nyaa:magnetLink');
+    if (!magnet) continue;
 
-    // Episode number must match when provided (±0.01 for float safety)
-    if (episode != null && !isNaN(Number(episode))) {
-      if (Math.abs(parsed.episode - Number(episode)) > 0.01) continue;
-    }
+    var hash     = xmlTag(item, 'nyaa:infoHash') || infoHash(magnet);
+    var seeders  = parseInt(xmlTag(item, 'nyaa:seeders'),  10) || 0;
+    var leechers = parseInt(xmlTag(item, 'nyaa:leechers'), 10) || 0;
+    var dls      = parseInt(xmlTag(item, 'nyaa:downloads'),10) || 0;
+    var size     = parseSize(xmlTag(item, 'nyaa:size'));
+    var pubDate  = xmlTag(item, 'pubDate');
 
-    // Exclusions
-    if (isExcluded(parsed.title, exclusions)) continue;
-
-    var torrent = makeTorrent(parsed.title, parsed.magnet, parsed.pubDate, parsed.isBatch);
-    if (torrent) results.push(torrent);
+    results.push({
+      title:     title,
+      link:      magnet,
+      seeders:   seeders,
+      leechers:  leechers,
+      downloads: dls,
+      accuracy:  'high',
+      hash:      hash,
+      size:      size,
+      date:      pubDate ? new Date(pubDate) : new Date(),
+    });
   }
 
   return results;
+}
+
+// ─── Core: try each non-ASCII-filtered title until results are found ─────────
+// Stops at the first title that returns results → usually one Nyaa call.
+
+async function tryTitles(fetchFn, titles, buildQuery, exclusions) {
+  var tried = 0;
+  for (var i = 0; i < titles.length; i++) {
+    var t = titles[i];
+    if (!t || typeof t !== 'string') continue;
+    if (isNonAscii(t)) continue;       // skip Japanese/Korean native titles
+    if (tried >= 3) break;             // cap at 3 attempts to stay under 10s
+    tried++;
+
+    var query   = buildQuery(t);
+    var results = await nyaaFetch(fetchFn, query);
+
+    // Filter exclusions
+    if (Array.isArray(exclusions)) {
+      results = results.filter(function(r) { return !isExcluded(r.title, exclusions); });
+    }
+
+    if (results.length > 0) return results;
+  }
+  return [];
 }
 
 // ─── Extension export ─────────────────────────────────────────────────────────
 
 export default {
 
-  // Returns true immediately — avoids timeout from network calls in worker
+  // test() returns true immediately — avoids the 10s timeout.
+  // The real functionality is validated on first search.
   async test() {
     return true;
   },
 
-  // Single episode: try 1080p → 720p → SD until something is found
+  // ── single() ────────────────────────────────────────────────────────────────
+  // Searches Nyaa for: [SubsPlease] {Show} - {Episode} (1080p)
+  // Falls back to without resolution filter if no results.
+
   async single(query, options) {
     try {
       var titles     = query && query.titles;
@@ -224,12 +190,18 @@ export default {
       if (typeof fetchFn !== 'function') return [];
       if (!Array.isArray(titles) || titles.length === 0) return [];
 
-      var results = await searchRSS(fetchFn, '1080', titles, episode, exclusions);
+      var epStr = fmtEp(episode);
+
+      // Pass 1: search with episode + resolution for precision
+      var results = await tryTitles(fetchFn, titles, function(t) {
+        return '[SubsPlease] ' + t + ' - ' + epStr + ' (1080p)';
+      }, exclusions);
+
+      // Pass 2: drop resolution filter — catch 720p/SD results
       if (results.length === 0) {
-        results = await searchRSS(fetchFn, '720', titles, episode, exclusions);
-      }
-      if (results.length === 0) {
-        results = await searchRSS(fetchFn, 'sd', titles, episode, exclusions);
+        results = await tryTitles(fetchFn, titles, function(t) {
+          return '[SubsPlease] ' + t + ' - ' + epStr;
+        }, exclusions);
       }
 
       return results;
@@ -238,7 +210,9 @@ export default {
     }
   },
 
-  // Batch: same RSS, filter to batch-tagged releases only
+  // ── batch() ─────────────────────────────────────────────────────────────────
+  // Searches Nyaa for: [SubsPlease] {Show} Batch
+
   async batch(query, options) {
     try {
       var titles     = query && query.titles;
@@ -248,12 +222,13 @@ export default {
       if (typeof fetchFn !== 'function') return [];
       if (!Array.isArray(titles) || titles.length === 0) return [];
 
-      var results = await searchRSS(fetchFn, '1080', titles, null, exclusions);
-      results = results.filter(function(r) { return r.type === 'batch'; });
+      var results = await tryTitles(fetchFn, titles, function(t) {
+        return '[SubsPlease] ' + t + ' Batch';
+      }, exclusions);
 
-      if (results.length === 0) {
-        results = await searchRSS(fetchFn, '720', titles, null, exclusions);
-        results = results.filter(function(r) { return r.type === 'batch'; });
+      // Tag all results as batch type
+      for (var i = 0; i < results.length; i++) {
+        results[i].type = 'batch';
       }
 
       return results;
@@ -262,10 +237,12 @@ export default {
     }
   },
 
-  // Movie: SubsPlease releases movies as episode 1
+  // ── movie() ─────────────────────────────────────────────────────────────────
+  // Movies appear as single episodes on Nyaa — delegates to single().
+
   async movie(query, options) {
     try {
-      var episode = Number(query && query.episode) || 1;
+      var episode  = Number(query && query.episode) || 1;
       var modified = Object.assign({}, query, { episode: episode });
       return await this.single(modified, options);
     } catch (e) {
